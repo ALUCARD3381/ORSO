@@ -81,4 +81,32 @@ float AdamW::step() {
     return grad_norm;
 }
 
+std::vector<std::vector<float>> AdamW::first_moment() const {
+    return m_;
+}
+
+std::vector<std::vector<float>> AdamW::second_moment() const {
+    return v_;
+}
+
+void AdamW::load_state(const std::vector<std::vector<float>>& first,
+                       const std::vector<std::vector<float>>& second,
+                       std::size_t step_count) {
+    if (first.size() != parameters_.size() || second.size() != parameters_.size())
+        throw std::invalid_argument("AdamW state parameter count mismatch");
+    for (std::size_t i = 0; i < parameters_.size(); ++i) {
+        if (first[i].size() != parameters_[i].size() || second[i].size() != parameters_[i].size())
+            throw std::invalid_argument("AdamW state parameter size mismatch");
+        for (float value : first[i]) {
+            if (!std::isfinite(value)) throw std::invalid_argument("AdamW first moment contains non-finite value");
+        }
+        for (float value : second[i]) {
+            if (!std::isfinite(value)) throw std::invalid_argument("AdamW second moment contains non-finite value");
+        }
+    }
+    m_ = first;
+    v_ = second;
+    step_count_ = step_count;
+}
+
 } // namespace orso

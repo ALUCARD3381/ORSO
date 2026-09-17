@@ -5,6 +5,7 @@
 #include "orso/transformer.hpp"
 #include "orso/model.hpp"
 #include "orso/optimizer.hpp"
+#include "orso/model.hpp"
 
 namespace py = pybind11;
 using orso::Tensor;
@@ -96,7 +97,10 @@ PYBIND11_MODULE(orso_core, m) {
         .def("forward", &orso::TransformerModel::forward)
         .def("parameters", &orso::TransformerModel::parameters)
         .def_property_readonly("parameter_count", &orso::TransformerModel::parameter_count)
-        .def_property_readonly("context_length", [](const orso::TransformerModel& model){ return model.config().context_length; });
+        .def_property_readonly("context_length", [](const orso::TransformerModel& model){ return model.config().context_length; })
+        .def_property_readonly("config", [](const orso::TransformerModel& model){ return model.config(); })
+        .def("parameter_data", &orso::TransformerModel::parameter_data)
+        .def("load_parameter_data", &orso::TransformerModel::load_parameter_data);
 
     py::class_<orso::AdamW>(m, "AdamW")
         .def(py::init<const std::vector<Tensor>&, float, float, float, float, float, float>(),
@@ -106,5 +110,13 @@ PYBIND11_MODULE(orso_core, m) {
         .def("zero_grad", &orso::AdamW::zero_grad)
         .def("step", &orso::AdamW::step)
         .def_property("lr", &orso::AdamW::lr, &orso::AdamW::set_lr)
-        .def_property_readonly("step_count", &orso::AdamW::step_count);
+        .def_property_readonly("step_count", &orso::AdamW::step_count)
+        .def_property_readonly("beta1", &orso::AdamW::beta1)
+        .def_property_readonly("beta2", &orso::AdamW::beta2)
+        .def_property_readonly("eps", &orso::AdamW::eps)
+        .def_property_readonly("weight_decay", &orso::AdamW::weight_decay)
+        .def_property_readonly("max_grad_norm", &orso::AdamW::max_grad_norm)
+        .def("first_moment", &orso::AdamW::first_moment)
+        .def("second_moment", &orso::AdamW::second_moment)
+        .def("load_state", &orso::AdamW::load_state);
 }

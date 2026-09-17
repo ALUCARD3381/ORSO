@@ -1,4 +1,4 @@
-"""Training utilities for ORSO Phase 5."""
+"""Training utilities for ORSO Phase 5/6."""
 
 from __future__ import annotations
 
@@ -34,6 +34,22 @@ class CosineScheduler:
         self.optimizer.lr = max(self.min_lr if self.min_lr > 0 else 1.0e-12, lr)
         return self.optimizer.lr
 
+    def state_dict(self) -> dict[str, float | int]:
+        return {
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "min_lr": self.min_lr,
+            "base_lr": self.base_lr,
+            "step_count": self.step_count,
+        }
+
+    def load_state_dict(self, state: dict[str, float | int]) -> None:
+        self.total_steps = int(state["total_steps"])
+        self.warmup_steps = int(state["warmup_steps"])
+        self.min_lr = float(state["min_lr"])
+        self.base_lr = float(state["base_lr"])
+        self.step_count = int(state["step_count"])
+
 
 class Trainer:
     def __init__(self, model, optimizer: AdamW, scheduler: CosineScheduler | None = None):
@@ -53,3 +69,9 @@ class Trainer:
         if self.scheduler is not None:
             lr = self.scheduler.step()
         return {"loss": loss.item(), "grad_norm": grad_norm, "lr": lr, "step": float(self.steps)}
+
+    def state_dict(self) -> dict[str, int]:
+        return {"steps": int(self.steps)}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.steps = int(state["steps"])

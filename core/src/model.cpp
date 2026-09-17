@@ -1,5 +1,6 @@
 #include "orso/model.hpp"
 #include "orso/transformer.hpp"
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -102,6 +103,30 @@ std::size_t TransformerModel::parameter_count() const {
     std::size_t total = 0;
     for (const Tensor& p : parameters()) total += p.size();
     return total;
+}
+
+std::vector<std::vector<float>> TransformerModel::parameter_data() const {
+    std::vector<std::vector<float>> out;
+    const auto params = parameters();
+    out.reserve(params.size());
+    for (const Tensor& p : params) out.push_back(p.data());
+    return out;
+}
+
+void TransformerModel::load_parameter_data(const std::vector<std::vector<float>>& values) {
+    auto params = parameters();
+    if (values.size() != params.size())
+        throw std::invalid_argument("parameter count mismatch while loading model state");
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (values[i].size() != params[i].size())
+            throw std::invalid_argument("parameter size mismatch while loading model state");
+        for (float value : values[i]) {
+            if (!std::isfinite(value)) throw std::invalid_argument("model state contains non-finite value");
+        }
+        auto& dst = params[i].mutable_data();
+        std::copy(values[i].begin(), values[i].end(), dst.begin());
+        params[i].zero_grad();
+    }
 }
 
 } // namespace orso

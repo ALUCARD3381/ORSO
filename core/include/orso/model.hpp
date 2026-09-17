@@ -24,6 +24,8 @@ public:
     Tensor forward(const std::vector<std::vector<int>>& token_ids) const;
 
     std::vector<Tensor> parameters() const;
+    std::vector<std::vector<float>> parameter_data() const;
+    void load_parameter_data(const std::vector<std::vector<float>>& values);
     std::size_t parameter_count() const;
     const ModelConfig& config() const { return config_; }
 

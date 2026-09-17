@@ -20,8 +20,19 @@ public:
     float step();
 
     float lr() const { return lr_; }
+    float beta1() const { return beta1_; }
+    float beta2() const { return beta2_; }
+    float eps() const { return eps_; }
+    float weight_decay() const { return weight_decay_; }
+    float max_grad_norm() const { return max_grad_norm_; }
     void set_lr(float value);
     std::size_t step_count() const { return step_count_; }
+
+    std::vector<std::vector<float>> first_moment() const;
+    std::vector<std::vector<float>> second_moment() const;
+    void load_state(const std::vector<std::vector<float>>& first,
+                    const std::vector<std::vector<float>>& second,
+                    std::size_t step_count);
 
 private:
     std::vector<Tensor> parameters_;
