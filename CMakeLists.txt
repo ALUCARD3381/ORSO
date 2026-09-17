@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(ORSO VERSION 0.4.0 LANGUAGES CXX)
+project(ORSO VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,6 +58,8 @@ add_library(orso_core_impl STATIC
     core/src/tensor.cpp
     core/src/neon_kernels.cpp
     core/src/transformer.cpp
+    core/src/model.cpp
+    core/src/optimizer.cpp
 )
 
 target_include_directories(orso_core_impl

@@ -1,0 +1,50 @@
+#pragma once
+
+#include "orso/tensor.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace orso {
+
+struct ModelConfig {
+    std::size_t vocab_size{768};
+    std::size_t d_model{64};
+    std::size_t num_heads{8};
+    std::size_t hidden_dim{256};
+    std::size_t num_layers{6};
+    std::size_t context_length{32};
+    std::uint64_t seed{1234};
+};
+
+class TransformerModel {
+public:
+    explicit TransformerModel(const ModelConfig& config = {});
+
+    Tensor forward(const std::vector<std::vector<int>>& token_ids) const;
+
+    std::vector<Tensor> parameters() const;
+    std::size_t parameter_count() const;
+    const ModelConfig& config() const { return config_; }
+
+private:
+    struct Block {
+        Tensor norm1;
+        Tensor wq;
+        Tensor wk;
+        Tensor wv;
+        Tensor wo;
+        Tensor norm2;
+        Tensor wgate;
+        Tensor wup;
+        Tensor wdown;
+    };
+
+    ModelConfig config_;
+    Tensor embedding_weight_;
+    std::vector<Block> blocks_;
+    Tensor final_norm_;
+    Tensor lm_head_;
+};
+
+} // namespace orso

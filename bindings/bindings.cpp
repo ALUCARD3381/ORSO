@@ -3,6 +3,8 @@
 
 #include "orso/tensor.hpp"
 #include "orso/transformer.hpp"
+#include "orso/model.hpp"
+#include "orso/optimizer.hpp"
 
 namespace py = pybind11;
 using orso::Tensor;
@@ -68,4 +70,41 @@ PYBIND11_MODULE(orso_core, m) {
           py::arg("x"), py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"),
           py::arg("num_heads"), py::arg("causal")=true, py::arg("rope_theta")=10000.0f);
     m.def("swiglu", &orso::swiglu);
+    m.def("cross_entropy", &orso::cross_entropy, py::arg("logits"), py::arg("targets"), py::arg("ignore_index")=-1);
+
+    py::class_<orso::ModelConfig>(m, "ModelConfig")
+        .def(py::init<>())
+        .def_readwrite("vocab_size", &orso::ModelConfig::vocab_size)
+        .def_readwrite("d_model", &orso::ModelConfig::d_model)
+        .def_readwrite("num_heads", &orso::ModelConfig::num_heads)
+        .def_readwrite("hidden_dim", &orso::ModelConfig::hidden_dim)
+        .def_readwrite("num_layers", &orso::ModelConfig::num_layers)
+        .def_readwrite("context_length", &orso::ModelConfig::context_length)
+        .def_readwrite("seed", &orso::ModelConfig::seed);
+
+    py::class_<orso::TransformerModel>(m, "Model")
+        .def(py::init<const orso::ModelConfig&>(), py::arg("config")=orso::ModelConfig{})
+        .def(py::init([](std::size_t vocab_size, std::size_t d_model, std::size_t num_heads,
+                         std::size_t hidden_dim, std::size_t num_layers, std::size_t context_length,
+                         std::uint64_t seed) {
+            orso::ModelConfig cfg;
+            cfg.vocab_size = vocab_size; cfg.d_model = d_model; cfg.num_heads = num_heads;
+            cfg.hidden_dim = hidden_dim; cfg.num_layers = num_layers; cfg.context_length = context_length; cfg.seed = seed;
+            return orso::TransformerModel(cfg);
+        }), py::arg("vocab_size")=768, py::arg("d_model")=64, py::arg("num_heads")=8,
+            py::arg("hidden_dim")=256, py::arg("num_layers")=6, py::arg("context_length")=32, py::arg("seed")=1234ULL)
+        .def("forward", &orso::TransformerModel::forward)
+        .def("parameters", &orso::TransformerModel::parameters)
+        .def_property_readonly("parameter_count", &orso::TransformerModel::parameter_count)
+        .def_property_readonly("context_length", [](const orso::TransformerModel& model){ return model.config().context_length; });
+
+    py::class_<orso::AdamW>(m, "AdamW")
+        .def(py::init<const std::vector<Tensor>&, float, float, float, float, float, float>(),
+             py::arg("parameters"), py::arg("lr")=3.0e-4f, py::arg("beta1")=0.9f,
+             py::arg("beta2")=0.999f, py::arg("eps")=1.0e-8f, py::arg("weight_decay")=0.01f,
+             py::arg("max_grad_norm")=0.0f)
+        .def("zero_grad", &orso::AdamW::zero_grad)
+        .def("step", &orso::AdamW::step)
+        .def_property("lr", &orso::AdamW::lr, &orso::AdamW::set_lr)
+        .def_property_readonly("step_count", &orso::AdamW::step_count);
 }

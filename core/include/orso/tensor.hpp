@@ -103,6 +103,7 @@ Tensor rmsnorm(const Tensor& x, const Tensor& weight, float eps = 1e-5f);
 Tensor rope(const Tensor& x, float theta = 10000.0f);
 Tensor embedding_lookup(const Tensor& weight, const std::vector<std::vector<int>>& token_ids);
 
+Tensor cross_entropy(const Tensor& logits, const std::vector<std::vector<int>>& targets, int ignore_index = -1);
 void ensure_same_shape(const Tensor& a, const Tensor& b, const char* op);
 void accumulate_grad(const std::shared_ptr<TensorImpl>& target, const std::vector<float>& grad);
 

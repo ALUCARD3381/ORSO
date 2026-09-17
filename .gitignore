@@ -8,3 +8,5 @@ checkpoints/*.orso
 # Build/package artifacts
 ORSO_phase4_complete.zip
 build/
+# Phase 5 package
+ORSO_phase5_complete.zip

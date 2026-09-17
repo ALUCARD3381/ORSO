@@ -538,4 +538,64 @@ Tensor embedding_lookup(const Tensor& weight, const std::vector<std::vector<int>
     return result;
 }
 
+Tensor cross_entropy(const Tensor& logits, const std::vector<std::vector<int>>& targets, int ignore_index) {
+    if (logits.ndim() != 3) throw std::invalid_argument("cross_entropy expects logits=[B,T,V]");
+    const std::size_t B = logits.shape()[0];
+    const std::size_t T = logits.shape()[1];
+    const std::size_t V = logits.shape()[2];
+    if (targets.size() != B) throw std::invalid_argument("cross_entropy target batch mismatch");
+    for (const auto& row : targets) if (row.size() != T) throw std::invalid_argument("cross_entropy target shape mismatch");
+
+    std::size_t count = 0;
+    double total = 0.0;
+    std::vector<float> row_probs(V);
+    for (std::size_t b = 0; b < B; ++b) {
+        for (std::size_t t = 0; t < T; ++t) {
+            const int target = targets[b][t];
+            if (target == ignore_index) continue;
+            if (target < 0 || static_cast<std::size_t>(target) >= V) throw std::out_of_range("cross_entropy target out of range");
+            const std::size_t base = (b * T + t) * V;
+            float maxv = -std::numeric_limits<float>::infinity();
+            for (std::size_t j = 0; j < V; ++j) maxv = std::max(maxv, logits.data()[base + j]);
+            double sumexp = 0.0;
+            for (std::size_t j = 0; j < V; ++j) {
+                row_probs[j] = std::exp(logits.data()[base + j] - maxv);
+                sumexp += row_probs[j];
+            }
+            total += -(static_cast<double>(logits.data()[base + static_cast<std::size_t>(target)]) - static_cast<double>(maxv) - std::log(sumexp));
+            ++count;
+        }
+    }
+    if (count == 0) throw std::invalid_argument("cross_entropy has no valid targets");
+
+    const float loss = static_cast<float>(total / static_cast<double>(count));
+    const bool req = logits.requires_grad();
+    auto result = make_result({1}, {loss}, req);
+    if (req) {
+        result.impl()->grad_fn = node_for({logits}, [ilogits = logits.impl(), targets, ignore_index, B, T, V, count](const std::vector<float>& gout) {
+            std::vector<float> grad(ilogits->data.size(), 0.0f);
+            const float scale = gout[0] / static_cast<float>(count);
+            std::vector<float> probs(V);
+            for (std::size_t b = 0; b < B; ++b) {
+                for (std::size_t t = 0; t < T; ++t) {
+                    const int target = targets[b][t];
+                    if (target == ignore_index) continue;
+                    const std::size_t base = (b * T + t) * V;
+                    float maxv = -std::numeric_limits<float>::infinity();
+                    for (std::size_t j = 0; j < V; ++j) maxv = std::max(maxv, ilogits->data[base + j]);
+                    float sumexp = 0.0f;
+                    for (std::size_t j = 0; j < V; ++j) {
+                        probs[j] = std::exp(ilogits->data[base + j] - maxv);
+                        sumexp += probs[j];
+                    }
+                    for (std::size_t j = 0; j < V; ++j) grad[base + j] += scale * (probs[j] / sumexp);
+                    grad[base + static_cast<std::size_t>(target)] -= scale;
+                }
+            }
+            add_same_shape_grad(ilogits, grad);
+        });
+    }
+    return result;
+}
+
 } // namespace orso
