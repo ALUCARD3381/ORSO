@@ -1,9 +1,8 @@
-"""Unified ORSO runtime: checkpoint, tokenizer, session and inference."""
+"""Unified ORSO runtime: checkpoint, tokenizer, session, cache and inference."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .checkpoint import load_checkpoint
 from .chat import ChatSession
@@ -17,6 +16,7 @@ class RuntimeStats:
     vocab_size: int
     trainer_steps: int
     optimizer_steps: int
+    kv_cache_length: int
 
 
 class ORSORuntime:
@@ -29,21 +29,38 @@ class ORSORuntime:
         self.model = state.model
         self.tokenizer = state.tokenizer
         self.session = session or ChatSession()
+        self.reset_kv_cache()
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, *, session: ChatSession | None = None) -> "ORSORuntime":
         return cls(load_checkpoint(path), session=session)
 
+    def reset_kv_cache(self) -> None:
+        reset = getattr(self.model, "reset_kv_cache", None)
+        if callable(reset):
+            reset()
+
     @property
     def stats(self) -> RuntimeStats:
         cfg = self.model.config
+        parameter_count = getattr(self.model, "parameter_count", 0)
+        if callable(parameter_count):
+            parameter_count = parameter_count()
+        kv_len = getattr(self.model, "kv_cache_length", 0)
+        if callable(kv_len):
+            kv_len = kv_len()
         return RuntimeStats(
-            parameter_count=int(self.model.parameter_count()),
+            parameter_count=int(parameter_count),
             context_length=int(cfg.context_length),
             vocab_size=int(cfg.vocab_size),
             trainer_steps=int(self.state.trainer_steps),
             optimizer_steps=int(self.state.optimizer.step_count),
+            kv_cache_length=int(kv_len),
         )
+
+    def clear_session(self) -> None:
+        self.session.clear()
+        self.reset_kv_cache()
 
     def respond(
         self,
@@ -66,10 +83,12 @@ class ORSORuntime:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
             seed=seed,
             eos_token_id=eos_token_id,
+            use_cache=True,
         )
-        reply = self.tokenizer.decode(generated[len(prompt_ids) :]).strip()
+        reply = self.tokenizer.decode(generated[len(prompt_ids):]).strip()
         self.session.add("user", user_text)
         self.session.add("assistant", reply)
         return reply
@@ -79,3 +98,4 @@ class ORSORuntime:
 
     def load_session(self, path: str | Path) -> None:
         self.session = ChatSession.load(path)
+        self.reset_kv_cache()

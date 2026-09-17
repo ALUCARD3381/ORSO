@@ -1,13 +1,36 @@
 #!/usr/bin/env python3
-"""Interactive ORSO terminal chat."""
+"""Interactive ORSO terminal chat with ANSI styling."""
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from orso.chat import ChatSession
 from orso.runtime import ORSORuntime
+
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+
+
+def colorize(text: str, color: str, enabled: bool = True) -> str:
+    return f"{color}{text}{RESET}" if enabled else text
+
+
+def render_banner(use_color: bool = True) -> str:
+    lines = [
+        "╔══════════════════════════════════════╗",
+        "║              O R S O                ║",
+        "║        local mini-LLM runtime       ║",
+        "╚══════════════════════════════════════╝",
+    ]
+    out = []
+    for i, line in enumerate(lines):
+        color = CYAN if i in (0, 3) else GREEN
+        out.append(colorize(line, color, use_color))
+    return "\n".join(out)
 
 
 def main() -> None:
@@ -22,6 +45,7 @@ def main() -> None:
     p.add_argument("--max-turns", type=int, default=12)
     p.add_argument("--max-chars", type=int, default=12000)
     p.add_argument("--session", default="")
+    p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
 
     session = ChatSession(system_prompt=args.system, max_turns=args.max_turns, max_chars=args.max_chars)
@@ -29,11 +53,9 @@ def main() -> None:
     if args.session and Path(args.session).exists():
         runtime.load_session(args.session)
 
+    color = not args.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     st = runtime.stats
-    print("╔══════════════════════════════════════╗")
-    print("║              O R S O                ║")
-    print("║        local mini-LLM runtime       ║")
-    print("╚══════════════════════════════════════╝")
+    print(render_banner(color))
     print(f"params={st.parameter_count} vocab={st.vocab_size} context={st.context_length} step={st.trainer_steps}")
     print("/exit  /clear  /save  /stats")
 
@@ -48,12 +70,12 @@ def main() -> None:
         if line == "/exit":
             break
         if line == "/clear":
-            runtime.session.clear()
+            runtime.clear_session()
             print("Context cleared.")
             continue
         if line == "/stats":
             st = runtime.stats
-            print(f"params={st.parameter_count} vocab={st.vocab_size} context={st.context_length} step={st.trainer_steps}")
+            print(f"params={st.parameter_count} vocab={st.vocab_size} context={st.context_length} cache={st.kv_cache_length} step={st.trainer_steps}")
             continue
         if line == "/save":
             path = args.session or "session.orso.json"
@@ -69,7 +91,7 @@ def main() -> None:
                 top_p=args.top_p,
                 seed=args.seed,
             )
-            print(f"ORSO> {answer}")
+            print(f"{colorize('ORSO>', CYAN, color)} {answer}")
         except Exception as exc:
             print(f"ORSO error: {exc}", file=sys.stderr)
             raise

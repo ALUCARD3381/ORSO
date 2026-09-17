@@ -1,53 +1,24 @@
-# ORSO Fase 7 — Complete ORSO
+# ORSO Phase 7 — Final Runtime
 
-A Fase 7 fecha o fluxo de execução em uma camada única: checkpoint → tokenizer → modelo → memória de sessão → inference → CLI.
+Phase 7 finalizes the runtime with:
 
-## Componentes
+- unified checkpoint/tokenizer/model runtime;
+- bounded chat session memory;
+- temperature, top-k and top-p sampling;
+- native incremental KV-cache per Transformer layer;
+- automatic cache rebuild when the sliding context window is exceeded;
+- `/exit`, `/clear`, `/save` and `/stats` chat commands;
+- green/cyan ANSI terminal banner with `--no-color` and `NO_COLOR` fallback;
+- deterministic cache-vs-non-cache integration tests.
 
-- `orso/chat.py`: memória textual limitada por turnos e caracteres.
-- `orso/runtime.py`: runtime unificado para checkpoint, sessão, inferência e estatísticas.
-- `orso/inference.py`: sampling greedy, temperature, top-k e top-p.
-- `scripts/chat.py`: chat interativo de terminal.
-- `scripts/train.py`: primeiro fluxo de treino + checkpoint em uma única CLI.
-- `scripts/inspect.py`: inspeção de checkpoint sem iniciar chat.
-- `tests/test_phase7.py`: validação do pipeline integrado.
+## KV-cache semantics
 
-## Limite de contexto
+`Model.forward()` remains the training/reference path. `Model.forward_cached()` is inference-only and keeps rotated K plus V tensors for every Transformer layer. New tokens calculate only their query and new K/V, then attend against the cached history.
 
-A memória de sessão guarda os turnos mais recentes e reduz o prompt ao orçamento configurado. Na geração, o modelo continua respeitando `context_length` e usa a janela final de tokens. Não é afirmado aqui um KV-cache nativo; a implementação usa recomputação causal da Fase 6.
+When the active context reaches `context_length`, the runtime rebuilds the cache from the newest `context_length - 1` tokens plus the new token. This keeps the cached path numerically aligned with the existing sliding-window reference path and restarts RoPE positions consistently.
 
-## Chat
+Use `model.reset_kv_cache()` to explicitly clear the cache. `ORSORuntime.clear_session()` and `load_session()` also reset it.
 
-```bash
-PYTHONPATH="$PWD" python scripts/chat.py checkpoints/model.orso \
-  --temperature 0.7 --top-k 40 --top-p 0.95 --tokens 64
-```
+## CLI colors
 
-Com persistência da conversa:
-
-```bash
-PYTHONPATH="$PWD" python scripts/chat.py checkpoints/model.orso --session data/session.json
-```
-
-## Treino integrado
-
-```bash
-PYTHONPATH="$PWD" python scripts/train.py data/corpus.txt checkpoints/model.orso \
-  --steps 1000 --context 32
-```
-
-## Inspeção
-
-```bash
-PYTHONPATH="$PWD" python scripts/inspect.py checkpoints/model.orso
-```
-
-## Validação
-
-A Fase 7 só deve virar commit depois de:
-
-1. build C++ no ARMv7;
-2. testes das Fases 1–7 passando;
-3. chat carregando um checkpoint real;
-4. inspeção do checkpoint sem erro;
-5. `git status` revisado para excluir ZIPs e artefatos temporários.
+`scripts/chat.py` uses ANSI green (`92`) and cyan (`96`) for the banner and prompt/output accents. Pass `--no-color` or set `NO_COLOR=1` to disable them.
