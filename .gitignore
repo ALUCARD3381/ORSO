@@ -5,6 +5,10 @@ build/
 *.so
 checkpoints/*.orso
 
+*.orso.json
+data/*.txt
+*.log
+
 # Build/package artifacts
 ORSO_phase4_complete.zip
 build/
