@@ -1,488 +1,541 @@
-#include "tensor.hpp"
-#include "neon_kernels.hpp"
+#include "orso/tensor.hpp"
+#include "orso/neon_kernels.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace orso {
-
 namespace {
 
-thread_local bool g_autograd_enabled = true;
-
-struct NoGradGuard {
-    bool previous;
-    NoGradGuard() noexcept : previous(g_autograd_enabled) { g_autograd_enabled = false; }
-    ~NoGradGuard() { g_autograd_enabled = previous; }
-};
-
-Tensor transpose_last2(const Tensor& t) {
-    if (t.ndim() < 2) {
-        throw std::invalid_argument("transpose_last2 requires rank >= 2");
+std::size_t numel(const Shape& shape) {
+    if (shape.empty()) return 1;
+    std::size_t n = 1;
+    for (std::size_t d : shape) {
+        if (d == 0) return 0;
+        if (n > std::numeric_limits<std::size_t>::max() / d) throw std::overflow_error("Tensor size overflow");
+        n *= d;
     }
-    std::vector<std::size_t> axes(t.ndim());
-    std::iota(axes.begin(), axes.end(), 0);
-    std::swap(axes[t.ndim() - 1], axes[t.ndim() - 2]);
-    return t.transpose(axes);
+    return n;
 }
 
-void ensure_same_shape(const Tensor& a, const Tensor& b, const char* op) {
-    if (a.shape() != b.shape()) {
-        throw std::invalid_argument(std::string(op) + " requires equal tensor shapes");
-    }
+std::vector<std::size_t> strides_for(const Shape& shape) {
+    std::vector<std::size_t> strides(shape.size(), 1);
+    if (shape.empty()) return strides;
+    for (std::size_t i = shape.size(); i-- > 1;) strides[i - 1] = strides[i] * shape[i];
+    return strides;
+}
+
+void validate_index(const Shape& shape, const std::vector<std::size_t>& idx) {
+    if (idx.size() != shape.size()) throw std::invalid_argument("Index rank mismatch");
+    for (std::size_t i = 0; i < shape.size(); ++i)
+        if (idx[i] >= shape[i]) throw std::out_of_range("Tensor index out of range");
+}
+
+std::size_t flat_index(const Shape& shape, const std::vector<std::size_t>& idx) {
+    validate_index(shape, idx);
+    const auto strides = strides_for(shape);
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < idx.size(); ++i) out += idx[i] * strides[i];
+    return out;
+}
+
+void check_same_numel(const Shape& a, const Shape& b) {
+    if (numel(a) != numel(b)) throw std::invalid_argument("Reshape changes tensor size");
+}
+
+std::shared_ptr<BackwardNode> node_for(const std::vector<Tensor>& parents,
+                                       std::function<void(const std::vector<float>&)> fn) {
+    auto node = std::make_shared<BackwardNode>();
+    for (const Tensor& p : parents) node->parents.push_back(p.impl());
+    node->backward = std::move(fn);
+    return node;
+}
+
+Tensor make_result(const Shape& shape, std::vector<float> data, bool req, std::shared_ptr<BackwardNode> node = nullptr) {
+    auto impl = std::make_shared<TensorImpl>();
+    impl->shape = shape;
+    impl->data = std::move(data);
+    impl->requires_grad = req;
+    impl->grad_fn = std::move(node);
+    if (req) impl->grad.assign(impl->data.size(), 0.0f);
+    return Tensor(std::move(impl));
+}
+
+void add_same_shape_grad(const std::shared_ptr<TensorImpl>& target, const std::vector<float>& g, float scale = 1.0f) {
+    if (!target || !target->requires_grad) return;
+    if (target->grad.empty()) target->grad.assign(target->data.size(), 0.0f);
+    for (std::size_t i = 0; i < g.size(); ++i) target->grad[i] += scale * g[i];
 }
 
 } // namespace
 
-Tensor::Tensor() : shape_{}, strides_{}, data_{0.0f}, autograd_(std::make_shared<AutogradMeta>()) {}
+Tensor::Tensor() : impl_(std::make_shared<TensorImpl>()) {}
 
-Tensor::Tensor(const std::vector<std::size_t>& shape)
-    : shape_(shape), data_(checked_numel(shape), 0.0f), autograd_(std::make_shared<AutogradMeta>()) {
-    validate_shape(shape_);
-    rebuild_strides();
+Tensor::Tensor(const Shape& shape, float fill, bool requires_grad) : impl_(std::make_shared<TensorImpl>()) {
+    impl_->shape = shape;
+    impl_->data.assign(numel(shape), fill);
+    impl_->requires_grad = requires_grad;
+    if (requires_grad) impl_->grad.assign(impl_->data.size(), 0.0f);
 }
 
-Tensor::Tensor(const std::vector<std::size_t>& shape, const std::vector<float>& data)
-    : shape_(shape), data_(data), autograd_(std::make_shared<AutogradMeta>()) {
-    validate_shape(shape_);
-    const auto expected = checked_numel(shape_);
-    if (expected != data_.size()) {
-        throw std::invalid_argument("Tensor data size does not match shape");
-    }
-    rebuild_strides();
+Tensor::Tensor(const Shape& shape, const std::vector<float>& values, bool requires_grad) : impl_(std::make_shared<TensorImpl>()) {
+    if (numel(shape) != values.size()) throw std::invalid_argument("Data size does not match shape");
+    impl_->shape = shape;
+    impl_->data = values;
+    impl_->requires_grad = requires_grad;
+    if (requires_grad) impl_->grad.assign(impl_->data.size(), 0.0f);
 }
 
-Tensor Tensor::zeros(const std::vector<std::size_t>& shape) { return Tensor(shape); }
-Tensor Tensor::ones(const std::vector<std::size_t>& shape) { return full(shape, 1.0f); }
+Tensor::Tensor(std::shared_ptr<TensorImpl> impl) : impl_(std::move(impl)) {}
 
-Tensor Tensor::full(const std::vector<std::size_t>& shape, float value) {
-    Tensor t(shape);
-    std::fill(t.data_.begin(), t.data_.end(), value);
+Tensor Tensor::zeros(const Shape& shape, bool requires_grad) { return Tensor(shape, 0.0f, requires_grad); }
+Tensor Tensor::ones(const Shape& shape, bool requires_grad) { return Tensor(shape, 1.0f, requires_grad); }
+Tensor Tensor::full(const Shape& shape, float value, bool requires_grad) { return Tensor(shape, value, requires_grad); }
+
+Tensor Tensor::random_normal(const Shape& shape, float mean, float stddev,
+                             unsigned long long seed, bool requires_grad) {
+    Tensor t(shape, 0.0f, requires_grad);
+    std::mt19937_64 rng(seed == 0 ? std::random_device{}() : seed);
+    std::normal_distribution<float> dist(mean, stddev);
+    for (float& v : t.impl_->data) v = dist(rng);
     return t;
 }
 
-void Tensor::validate_shape(const std::vector<std::size_t>& shape) {
-    (void)shape;
+const Shape& Tensor::shape() const { return impl_->shape; }
+std::size_t Tensor::ndim() const { return impl_->shape.size(); }
+std::size_t Tensor::size() const { return impl_->data.size(); }
+bool Tensor::requires_grad() const { return impl_->requires_grad; }
+void Tensor::set_requires_grad(bool value) {
+    impl_->requires_grad = value;
+    if (value && impl_->grad.empty()) impl_->grad.assign(impl_->data.size(), 0.0f);
+    if (!value) { impl_->grad.clear(); impl_->grad_fn.reset(); }
+}
+const std::vector<float>& Tensor::data() const { return impl_->data; }
+std::vector<float>& Tensor::mutable_data() { return impl_->data; }
+
+float Tensor::item() const {
+    if (impl_->data.size() != 1) throw std::invalid_argument("item() requires a single-element tensor");
+    return impl_->data[0];
 }
 
-std::size_t Tensor::checked_numel(const std::vector<std::size_t>& shape) {
-    if (shape.empty()) return 1;
-    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
-    std::size_t total = 1;
-    for (const auto dim : shape) {
-        if (dim != 0 && total > max_size / dim) {
-            throw std::overflow_error("Tensor size overflows size_t");
+float Tensor::get(const std::vector<std::size_t>& index) const { return impl_->data[flat_index(impl_->shape, index)]; }
+void Tensor::set(const std::vector<std::size_t>& index, float value) { impl_->data[flat_index(impl_->shape, index)] = value; }
+const std::vector<float>& Tensor::grad() const { return impl_->grad; }
+void Tensor::zero_grad() { if (impl_->requires_grad) std::fill(impl_->grad.begin(), impl_->grad.end(), 0.0f); }
+
+void Tensor::backward(const Tensor* grad_output) {
+    if (!impl_->requires_grad && !impl_->grad_fn) return;
+    std::vector<float> seed;
+    if (grad_output) {
+        if (grad_output->shape() != impl_->shape) throw std::invalid_argument("Gradient shape mismatch in backward()");
+        seed = grad_output->data();
+    } else {
+        if (impl_->data.size() != 1) throw std::invalid_argument("backward() without gradient requires scalar tensor");
+        seed.assign(1, 1.0f);
+    }
+
+    std::vector<std::shared_ptr<TensorImpl>> topo;
+    std::unordered_set<TensorImpl*> seen;
+    std::function<void(const std::shared_ptr<TensorImpl>&)> visit = [&](const std::shared_ptr<TensorImpl>& node) {
+        if (!node || !seen.insert(node.get()).second) return;
+        if (node->grad_fn) {
+            for (const auto& p : node->grad_fn->parents) visit(p);
         }
-        total *= dim;
+        topo.push_back(node);
+    };
+    visit(impl_);
+
+    if (impl_->grad.empty()) impl_->grad.assign(impl_->data.size(), 0.0f);
+    for (std::size_t i = 0; i < seed.size(); ++i) impl_->grad[i] += seed[i];
+
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+        if ((*it)->grad_fn) (*it)->grad_fn->backward((*it)->grad);
     }
-    return total;
 }
 
-std::vector<std::size_t> Tensor::make_contiguous_strides(const std::vector<std::size_t>& shape) {
-    std::vector<std::size_t> strides(shape.size(), 1);
-    if (shape.empty()) return strides;
-    for (std::size_t i = shape.size(); i-- > 1;) {
-        strides[i - 1] = strides[i] * shape[i];
-    }
-    return strides;
-}
-
-void Tensor::rebuild_strides() { strides_ = make_contiguous_strides(shape_); }
-
-std::size_t Tensor::offset(const std::vector<std::size_t>& indices) const {
-    if (indices.size() != shape_.size()) {
-        throw std::invalid_argument("Index rank does not match tensor rank");
-    }
-    std::size_t result = 0;
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        if (indices[i] >= shape_[i]) throw std::out_of_range("Tensor index out of range");
-        result += indices[i] * strides_[i];
+Tensor Tensor::reshape(const Shape& new_shape) const {
+    check_same_numel(impl_->shape, new_shape);
+    auto req = impl_->requires_grad;
+    auto result = make_result(new_shape, impl_->data, req);
+    if (req) {
+        result.impl()->grad_fn = node_for({*this}, [parent = impl_, old_shape = impl_->shape](const std::vector<float>& gout) {
+            (void)old_shape;
+            add_same_shape_grad(parent, gout);
+        });
     }
     return result;
 }
 
-float Tensor::item() const {
-    if (data_.size() != 1) throw std::invalid_argument("item() requires a tensor with exactly one element");
-    return data_[0];
-}
-
-float Tensor::get(const std::vector<std::size_t>& indices) const { return data_[offset(indices)]; }
-void Tensor::set(const std::vector<std::size_t>& indices, float value) { data_[offset(indices)] = value; }
-
-Tensor Tensor::reshape(const std::vector<std::size_t>& new_shape) const {
-    const auto expected = checked_numel(new_shape);
-    if (expected != data_.size()) throw std::invalid_argument("reshape cannot change the number of elements");
-    Tensor out(new_shape, data_);
-    if (requires_grad()) {
-        auto node = std::make_shared<AutogradNode>();
-        node->parents = {*this};
-        const auto old_shape = shape_;
-        node->backward = [old_shape](const Tensor& grad) {
-            return std::vector<Tensor>{grad.reshape(old_shape)};
-        };
-        out.attach_grad_fn(node);
+Tensor Tensor::transpose(const std::vector<std::size_t>& permutation) const {
+    if (permutation.size() != impl_->shape.size()) throw std::invalid_argument("Permutation rank mismatch");
+    std::vector<bool> used(permutation.size(), false);
+    for (auto p : permutation) {
+        if (p >= permutation.size() || used[p]) throw std::invalid_argument("Invalid transpose permutation");
+        used[p] = true;
     }
-    return out;
-}
-
-Tensor Tensor::transpose() const {
-    std::vector<std::size_t> axes(shape_.size());
-    std::iota(axes.begin(), axes.end(), 0);
-    std::reverse(axes.begin(), axes.end());
-    return transpose(axes);
-}
-
-Tensor Tensor::transpose(const std::vector<std::size_t>& axes) const {
-    if (axes.size() != shape_.size()) {
-        throw std::invalid_argument("transpose axes rank does not match tensor rank");
-    }
-    std::vector<bool> seen(shape_.size(), false);
-    for (const auto axis : axes) {
-        if (axis >= shape_.size() || seen[axis]) {
-            throw std::invalid_argument("transpose axes must be a permutation of tensor dimensions");
+    Shape out_shape(permutation.size());
+    for (std::size_t i = 0; i < permutation.size(); ++i) out_shape[i] = impl_->shape[permutation[i]];
+    const auto in_strides = strides_for(impl_->shape);
+    const auto out_strides = strides_for(out_shape);
+    std::vector<float> out(impl_->data.size());
+    for (std::size_t flat = 0; flat < out.size(); ++flat) {
+        std::size_t rem = flat;
+        std::vector<std::size_t> out_idx(out_shape.size(), 0);
+        for (std::size_t i = 0; i < out_shape.size(); ++i) {
+            out_idx[i] = rem / out_strides[i];
+            rem %= out_strides[i];
         }
-        seen[axis] = true;
+        std::size_t in_flat = 0;
+        for (std::size_t i = 0; i < permutation.size(); ++i) in_flat += out_idx[i] * in_strides[permutation[i]];
+        out[flat] = impl_->data[in_flat];
     }
 
-    std::vector<std::size_t> new_shape(shape_.size());
-    for (std::size_t i = 0; i < axes.size(); ++i) new_shape[i] = shape_[axes[i]];
-
-    Tensor out(new_shape);
-    if (!data_.empty()) {
-        std::vector<std::size_t> new_indices(new_shape.size(), 0);
-        std::vector<std::size_t> old_indices(shape_.size(), 0);
-        for (std::size_t linear = 0; linear < out.size(); ++linear) {
-            std::size_t remainder = linear;
-            for (std::size_t i = 0; i < new_shape.size(); ++i) {
-                const auto stride = out.strides_[i];
-                new_indices[i] = stride == 0 ? 0 : remainder / stride;
-                remainder = stride == 0 ? 0 : remainder % stride;
-                old_indices[axes[i]] = new_indices[i];
-            }
-            out.data_[linear] = data_[offset(old_indices)];
-        }
-    }
-
-    if (requires_grad()) {
-        auto node = std::make_shared<AutogradNode>();
-        node->parents = {*this};
-        std::vector<std::size_t> inverse(axes.size());
-        for (std::size_t i = 0; i < axes.size(); ++i) inverse[axes[i]] = i;
-        node->backward = [inverse](const Tensor& grad) {
-            return std::vector<Tensor>{grad.transpose(inverse)};
-        };
-        out.attach_grad_fn(node);
-    }
-    return out;
-}
-
-Tensor Tensor::elementwise_same_shape(const Tensor& other, char op) const {
-    ensure_same_shape(*this, other, "Elementwise operation");
-    Tensor out(shape_);
-    switch (op) {
-        case '+': neon::add(data_.data(), other.data_.data(), out.data_.data(), data_.size()); break;
-        case '-': neon::sub(data_.data(), other.data_.data(), out.data_.data(), data_.size()); break;
-        case '*': neon::mul(data_.data(), other.data_.data(), out.data_.data(), data_.size()); break;
-        case '/':
-            for (std::size_t i = 0; i < data_.size(); ++i) {
-                if (other.data_[i] == 0.0f) throw std::domain_error("Tensor division by zero");
-                out.data_[i] = data_[i] / other.data_[i];
-            }
-            break;
-        default: throw std::invalid_argument("Unknown elementwise operation");
-    }
-
-    if (requires_grad() || other.requires_grad()) {
-        auto node = std::make_shared<AutogradNode>();
-        node->parents = {*this, other};
-        if (op == '+') {
-            node->backward = [](const Tensor& grad) { return std::vector<Tensor>{grad, grad}; };
-        } else if (op == '-') {
-            node->backward = [](const Tensor& grad) { return std::vector<Tensor>{grad, grad.neg()}; };
-        } else if (op == '*') {
-            const Tensor a = *this;
-            const Tensor b = other;
-            node->backward = [a, b](const Tensor& grad) {
-                return std::vector<Tensor>{grad.mul(b), grad.mul(a)};
-            };
-        } else {
-            const Tensor a = *this;
-            const Tensor b = other;
-            node->backward = [a, b](const Tensor& grad) {
-                const Tensor db = b.mul(b);
-                const Tensor ga = grad.div(b);
-                const Tensor gb = grad.mul(a).div(db).neg();
-                return std::vector<Tensor>{ga, gb};
-            };
-        }
-        out.attach_grad_fn(node);
-    }
-    return out;
-}
-
-Tensor Tensor::add(const Tensor& other) const { return elementwise_same_shape(other, '+'); }
-Tensor Tensor::sub(const Tensor& other) const { return elementwise_same_shape(other, '-'); }
-Tensor Tensor::mul(const Tensor& other) const { return elementwise_same_shape(other, '*'); }
-Tensor Tensor::div(const Tensor& other) const { return elementwise_same_shape(other, '/'); }
-
-Tensor Tensor::mul(float scalar) const {
-    Tensor out(shape_);
-    for (std::size_t i = 0; i < data_.size(); ++i) out.data_[i] = data_[i] * scalar;
-    if (requires_grad()) {
-        auto node = std::make_shared<AutogradNode>();
-        node->parents = {*this};
-        node->backward = [scalar](const Tensor& grad) { return std::vector<Tensor>{grad.mul(scalar)}; };
-        out.attach_grad_fn(node);
-    }
-    return out;
-}
-
-Tensor Tensor::div(float scalar) const {
-    if (scalar == 0.0f) throw std::domain_error("Tensor division by zero");
-    Tensor out = mul(1.0f / scalar);
-    return out;
-}
-
-Tensor Tensor::neg() const { return mul(-1.0f); }
-
-std::size_t Tensor::flat_batch_count(const std::vector<std::size_t>& batch_shape) {
-    return checked_numel(batch_shape);
-}
-
-Tensor Tensor::matmul(const Tensor& other) const {
-    const auto ra = ndim();
-    const auto rb = other.ndim();
-    if (ra == 0 || rb == 0) throw std::invalid_argument("matmul requires tensors with rank >= 1");
-
-    Tensor out;
-
-    if (ra == 1 && rb == 1) {
-        if (shape_[0] != other.shape_[0]) throw std::invalid_argument("matmul dimension mismatch");
-        out = Tensor(std::vector<std::size_t>{});
-        out.data_[0] = neon::dot(data_.data(), other.data_.data(), shape_[0]);
-    } else if (ra == 2 && rb == 1) {
-        const auto m = shape_[0];
-        const auto k = shape_[1];
-        if (k != other.shape_[0]) throw std::invalid_argument("matmul dimension mismatch");
-        out = Tensor({m});
-        for (std::size_t i = 0; i < m; ++i) out.data_[i] = neon::dot(data_.data() + i * k, other.data_.data(), k);
-    } else if (ra == 1 && rb == 2) {
-        const auto k = shape_[0];
-        const auto n = other.shape_[1];
-        if (k != other.shape_[0]) throw std::invalid_argument("matmul dimension mismatch");
-        out = Tensor({n});
-        for (std::size_t j = 0; j < n; ++j) {
-            float sum = 0.0f;
-            for (std::size_t i = 0; i < k; ++i) sum += data_[i] * other.data_[i * n + j];
-            out.data_[j] = sum;
-        }
-    } else if (ra >= 2 && rb >= 2) {
-        const auto a_m = shape_[ra - 2];
-        const auto a_k = shape_[ra - 1];
-        const auto b_k = other.shape_[rb - 2];
-        const auto b_n = other.shape_[rb - 1];
-        if (a_k != b_k) throw std::invalid_argument("matmul inner dimensions mismatch");
-        const std::vector<std::size_t> a_batch(shape_.begin(), shape_.end() - 2);
-        const std::vector<std::size_t> b_batch(other.shape_.begin(), other.shape_.end() - 2);
-        if (a_batch != b_batch) throw std::invalid_argument("batched matmul requires identical batch dimensions");
-        std::vector<std::size_t> out_shape = a_batch;
-        out_shape.push_back(a_m);
-        out_shape.push_back(b_n);
-        out = Tensor(out_shape);
-        const auto batch_count = flat_batch_count(a_batch);
-        const auto a_matrix_size = a_m * a_k;
-        const auto b_matrix_size = a_k * b_n;
-        const auto out_matrix_size = a_m * b_n;
-        for (std::size_t batch = 0; batch < batch_count; ++batch) {
-            neon::matmul_2d(data_.data() + batch * a_matrix_size,
-                            other.data_.data() + batch * b_matrix_size,
-                            out.data_.data() + batch * out_matrix_size,
-                            a_m, a_k, b_n);
-        }
-    } else {
-        throw std::invalid_argument("Unsupported matmul rank combination");
-    }
-
-    if (requires_grad() || other.requires_grad()) {
-        auto node = std::make_shared<AutogradNode>();
-        node->parents = {*this, other};
-        const Tensor a = *this;
-        const Tensor b = other;
-        node->backward = [a, b](const Tensor& grad) {
-            Tensor ga;
-            Tensor gb;
-            const auto ra2 = a.ndim();
-            const auto rb2 = b.ndim();
-            if (ra2 == 1 && rb2 == 1) {
-                ga = b.mul(grad.item());
-                gb = a.mul(grad.item());
-            } else if (ra2 == 2 && rb2 == 1) {
-                const auto m = a.shape()[0];
-                const auto k = a.shape()[1];
-                ga = Tensor({m, k});
-                gb = Tensor({k});
-                for (std::size_t i = 0; i < m; ++i) {
-                    for (std::size_t p = 0; p < k; ++p) ga.data()[i * k + p] = grad.data()[i] * b.data()[p];
+    auto req = impl_->requires_grad;
+    auto result = make_result(out_shape, std::move(out), req);
+    if (req) {
+        result.impl()->grad_fn = node_for({*this}, [parent = impl_, permutation, out_shape](const std::vector<float>& gout) {
+            if (!parent->requires_grad) return;
+            const auto in_strides = strides_for(parent->shape);
+            const auto out_strides = strides_for(out_shape);
+            std::vector<float> gin(parent->data.size(), 0.0f);
+            std::vector<std::size_t> in_idx(parent->shape.size(), 0);
+            std::vector<std::size_t> out_idx(out_shape.size(), 0);
+            for (std::size_t in_flat = 0; in_flat < gin.size(); ++in_flat) {
+                std::size_t rem = in_flat;
+                for (std::size_t i = 0; i < parent->shape.size(); ++i) {
+                    in_idx[i] = rem / in_strides[i];
+                    rem %= in_strides[i];
                 }
-                for (std::size_t p = 0; p < k; ++p) {
-                    float s = 0.0f;
-                    for (std::size_t i = 0; i < m; ++i) s += a.data()[i * k + p] * grad.data()[i];
-                    gb.data()[p] = s;
-                }
-            } else if (ra2 == 1 && rb2 == 2) {
-                const auto k = a.shape()[0];
-                const auto n = b.shape()[1];
-                ga = Tensor({k});
-                gb = Tensor({k, n});
-                for (std::size_t p = 0; p < k; ++p) {
-                    float s = 0.0f;
-                    for (std::size_t j = 0; j < n; ++j) s += b.data()[p * n + j] * grad.data()[j];
-                    ga.data()[p] = s;
-                    for (std::size_t j = 0; j < n; ++j) gb.data()[p * n + j] = a.data()[p] * grad.data()[j];
-                }
-            } else if (ra2 >= 2 && rb2 >= 2) {
-                ga = grad.matmul(transpose_last2(b));
-                gb = transpose_last2(a).matmul(grad);
-            } else {
-                throw std::invalid_argument("Unsupported matmul backward rank combination");
+                for (std::size_t i = 0; i < permutation.size(); ++i) out_idx[i] = in_idx[permutation[i]];
+                std::size_t out_flat = 0;
+                for (std::size_t i = 0; i < out_idx.size(); ++i) out_flat += out_idx[i] * out_strides[i];
+                gin[in_flat] += gout[out_flat];
             }
-            return std::vector<Tensor>{ga, gb};
-        };
-        out.attach_grad_fn(node);
+            add_same_shape_grad(parent, gin);
+        });
     }
-    return out;
+    return result;
 }
 
-bool Tensor::requires_grad() const noexcept { return autograd_ && autograd_->requires_grad; }
-
-void Tensor::set_requires_grad(bool value) {
-    if (!autograd_) autograd_ = std::make_shared<AutogradMeta>();
-    autograd_->requires_grad = value;
-    if (value) {
-        autograd_->grad.assign(data_.size(), 0.0f);
-    } else {
-        autograd_->grad.clear();
-        autograd_->grad_fn.reset();
-    }
+Tensor Tensor::sum() const {
+    float s = std::accumulate(impl_->data.begin(), impl_->data.end(), 0.0f);
+    auto req = impl_->requires_grad;
+    auto result = make_result({1}, {s}, req);
+    if (req) result.impl()->grad_fn = node_for({*this}, [parent = impl_](const std::vector<float>& gout) {
+        if (!parent->requires_grad) return;
+        add_same_shape_grad(parent, std::vector<float>(parent->data.size(), gout[0]));
+    });
+    return result;
 }
 
-bool Tensor::has_grad() const noexcept {
-    return autograd_ && !autograd_->grad.empty();
+Tensor Tensor::mean() const {
+    if (impl_->data.empty()) throw std::invalid_argument("mean() of empty tensor");
+    const float inv = 1.0f / static_cast<float>(impl_->data.size());
+    float s = std::accumulate(impl_->data.begin(), impl_->data.end(), 0.0f) * inv;
+    auto req = impl_->requires_grad;
+    auto result = make_result({1}, {s}, req);
+    if (req) result.impl()->grad_fn = node_for({*this}, [parent = impl_, inv](const std::vector<float>& gout) {
+        if (!parent->requires_grad) return;
+        add_same_shape_grad(parent, std::vector<float>(parent->data.size(), gout[0] * inv));
+    });
+    return result;
 }
-
-Tensor Tensor::grad() const {
-    if (!has_grad()) throw std::runtime_error("Tensor has no accumulated gradient");
-    return Tensor(shape_, autograd_->grad);
-}
-
-void Tensor::zero_grad() {
-    if (requires_grad()) autograd_->grad.assign(data_.size(), 0.0f);
-}
-
-void Tensor::attach_grad_fn(std::shared_ptr<AutogradNode> node) {
-    if (!g_autograd_enabled || !node) return;
-    bool any = false;
-    for (const auto& parent : node->parents) any = any || parent.requires_grad();
-    if (!any) return;
-    if (!autograd_) autograd_ = std::make_shared<AutogradMeta>();
-    autograd_->requires_grad = true;
-    autograd_->grad_fn = std::move(node);
-    autograd_->grad.assign(data_.size(), 0.0f);
-}
-
-void Tensor::accumulate_grad(const std::shared_ptr<AutogradMeta>& meta, const Tensor& contribution) {
-    if (!meta || !meta->requires_grad) return;
-    if (meta->grad.size() != contribution.size()) meta->grad.assign(contribution.size(), 0.0f);
-    if (meta->grad.empty()) return;
-    for (std::size_t i = 0; i < meta->grad.size(); ++i) meta->grad[i] += contribution.data()[i];
-}
-
-std::vector<Tensor> Tensor::topo_sort(const Tensor& root) {
-    std::vector<Tensor> order;
-    std::unordered_set<const AutogradMeta*> visited;
-    std::function<void(const Tensor&)> dfs = [&](const Tensor& t) {
-        auto meta = t.autograd_;
-        if (!meta || !visited.insert(meta.get()).second) return;
-        if (meta->grad_fn) {
-            for (const auto& parent : meta->grad_fn->parents) dfs(parent);
-        }
-        order.push_back(t);
-    };
-    dfs(root);
-    return order;
-}
-
-void Tensor::backward() {
-    if (data_.size() != 1) {
-        throw std::invalid_argument("backward() requires a scalar output; provide an explicit gradient for non-scalars");
-    }
-    Tensor grad_tensor = Tensor({}, {1.0f});
-    backward(grad_tensor);
-}
-
-void Tensor::backward(const Tensor& grad) {
-    if (grad.shape() != shape_) throw std::invalid_argument("backward gradient shape must match output shape");
-    if (!requires_grad()) throw std::runtime_error("cannot call backward on a tensor that does not require gradients");
-
-    auto order = topo_sort(*this);
-    NoGradGuard no_grad;
-    std::unordered_map<AutogradMeta*, Tensor> local_grads;
-    local_grads.emplace(autograd_.get(), grad);
-
-    for (auto it = order.rbegin(); it != order.rend(); ++it) {
-        Tensor current = *it;
-        if (!current.autograd_) continue;
-        auto local_it = local_grads.find(current.autograd_.get());
-        if (local_it == local_grads.end()) continue;
-        if (!current.autograd_->grad_fn) continue;
-
-        const Tensor current_grad = local_it->second;
-        const auto& node = current.autograd_->grad_fn;
-        const auto contributions = node->backward(current_grad);
-        if (contributions.size() != node->parents.size()) {
-            throw std::runtime_error("autograd backward returned wrong number of gradients");
-        }
-        for (std::size_t i = 0; i < node->parents.size(); ++i) {
-            auto parent_meta = node->parents[i].autograd_;
-            if (!parent_meta || !parent_meta->requires_grad) continue;
-            auto found = local_grads.find(parent_meta.get());
-            if (found == local_grads.end()) {
-                local_grads.emplace(parent_meta.get(), contributions[i]);
-            } else {
-                ensure_same_shape(found->second, contributions[i], "autograd gradient accumulation");
-                for (std::size_t j = 0; j < found->second.data().size(); ++j) {
-                    found->second.data()[j] += contributions[i].data()[j];
-                }
-            }
-        }
-    }
-
-    for (auto& [meta_ptr, local] : local_grads) {
-        if (!meta_ptr || !meta_ptr->requires_grad) continue;
-        if (meta_ptr->grad.size() != local.size()) meta_ptr->grad.assign(local.size(), 0.0f);
-        for (std::size_t i = 0; i < local.size(); ++i) meta_ptr->grad[i] += local.data()[i];
-    }
-}
-
-void Tensor::fill(float value) { std::fill(data_.begin(), data_.end(), value); }
 
 std::string Tensor::repr() const {
     std::ostringstream oss;
     oss << "Tensor(shape=[";
-    for (std::size_t i = 0; i < shape_.size(); ++i) {
-        if (i) oss << ", ";
-        oss << shape_[i];
-    }
-    oss << "], size=" << data_.size() << ", requires_grad=" << (requires_grad() ? "true" : "false") << ")";
+    for (std::size_t i = 0; i < shape().size(); ++i) { if (i) oss << ", "; oss << shape()[i]; }
+    oss << "], requires_grad=" << (requires_grad() ? "true" : "false") << ", data=[";
+    const std::size_t preview = std::min<std::size_t>(data().size(), 8);
+    for (std::size_t i = 0; i < preview; ++i) { if (i) oss << ", "; oss << std::fixed << std::setprecision(5) << data()[i]; }
+    if (data().size() > preview) oss << ", ...";
+    oss << "])";
     return oss.str();
+}
+
+void ensure_same_shape(const Tensor& a, const Tensor& b, const char* op) {
+    if (a.shape() != b.shape()) throw std::invalid_argument(std::string(op) + ": shapes must match");
+}
+
+void accumulate_grad(const std::shared_ptr<TensorImpl>& target, const std::vector<float>& grad) {
+    add_same_shape_grad(target, grad);
+}
+
+namespace {
+
+template <typename Forward, typename Backward>
+Tensor elementwise_binary(const Tensor& a, const Tensor& b, Forward fwd, Backward bwd) {
+    ensure_same_shape(a, b, "elementwise op");
+    std::vector<float> out(a.size());
+    for (std::size_t i = 0; i < out.size(); ++i) out[i] = fwd(a.data()[i], b.data()[i]);
+    const bool req = a.requires_grad() || b.requires_grad();
+    auto result = make_result(a.shape(), std::move(out), req);
+    if (req) {
+        result.impl()->grad_fn = node_for({a, b}, [ia = a.impl(), ib = b.impl(), op_bwd = std::move(bwd)](const std::vector<float>& gout) mutable {
+            std::vector<float> ga(ia->data.size(), 0.0f), gb(ib->data.size(), 0.0f);
+            for (std::size_t i = 0; i < gout.size(); ++i) op_bwd(ia->data[i], ib->data[i], gout[i], ga[i], gb[i]);
+            add_same_shape_grad(ia, ga);
+            add_same_shape_grad(ib, gb);
+        });
+    }
+    return result;
+}
+
+template <typename Forward, typename Backward>
+Tensor elementwise_unary(const Tensor& a, Forward fwd, Backward bwd) {
+    std::vector<float> out(a.size());
+    for (std::size_t i = 0; i < out.size(); ++i) out[i] = fwd(a.data()[i]);
+    auto req = a.requires_grad();
+    auto result = make_result(a.shape(), std::move(out), req);
+    if (req) result.impl()->grad_fn = node_for({a}, [ia = a.impl(), op_bwd = std::move(bwd)](const std::vector<float>& gout) mutable {
+        std::vector<float> ga(ia->data.size(), 0.0f);
+        for (std::size_t i = 0; i < gout.size(); ++i) ga[i] = op_bwd(ia->data[i], gout[i]);
+        add_same_shape_grad(ia, ga);
+    });
+    return result;
+}
+
+} // namespace
+
+Tensor add(const Tensor& a, const Tensor& b) {
+    return elementwise_binary(a, b, [](float x, float y) { return x + y; },
+                              [](float, float, float g, float& ga, float& gb) { ga = g; gb = g; });
+}
+Tensor sub(const Tensor& a, const Tensor& b) {
+    return elementwise_binary(a, b, [](float x, float y) { return x - y; },
+                              [](float, float, float g, float& ga, float& gb) { ga = g; gb = -g; });
+}
+Tensor mul(const Tensor& a, const Tensor& b) {
+    ensure_same_shape(a, b, "mul");
+    std::vector<float> out(a.size()); kernels::mul_f32(a.data().data(), b.data().data(), out.data(), out.size());
+    auto req = a.requires_grad() || b.requires_grad();
+    auto result = make_result(a.shape(), std::move(out), req);
+    if (req) result.impl()->grad_fn = node_for({a, b}, [ia=a.impl(), ib=b.impl()](const std::vector<float>& gout) {
+        std::vector<float> ga(ia->data.size()), gb(ib->data.size());
+        for (std::size_t i=0;i<gout.size();++i) { ga[i]=gout[i]*ib->data[i]; gb[i]=gout[i]*ia->data[i]; }
+        add_same_shape_grad(ia,ga); add_same_shape_grad(ib,gb);
+    });
+    return result;
+}
+Tensor div(const Tensor& a, const Tensor& b) {
+    ensure_same_shape(a, b, "div");
+    std::vector<float> out(a.size());
+    for (std::size_t i=0;i<out.size();++i) out[i]=a.data()[i]/b.data()[i];
+    auto req = a.requires_grad() || b.requires_grad();
+    auto result = make_result(a.shape(), std::move(out), req);
+    if (req) result.impl()->grad_fn = node_for({a,b}, [ia=a.impl(),ib=b.impl()](const std::vector<float>& gout) {
+        std::vector<float> ga(ia->data.size()), gb(ib->data.size());
+        for (std::size_t i=0;i<gout.size();++i) {
+            ga[i]=gout[i]/ib->data[i];
+            gb[i]=-gout[i]*ia->data[i]/(ib->data[i]*ib->data[i]);
+        }
+        add_same_shape_grad(ia,ga); add_same_shape_grad(ib,gb);
+    });
+    return result;
+}
+Tensor add(const Tensor& a, float scalar) { return elementwise_unary(a,[scalar](float x){return x+scalar;},[](float,float g){return g;}); }
+Tensor sub(const Tensor& a, float scalar) { return elementwise_unary(a,[scalar](float x){return x-scalar;},[](float,float g){return g;}); }
+Tensor mul(const Tensor& a, float scalar) { return elementwise_unary(a,[scalar](float x){return x*scalar;},[scalar](float,float g){return g*scalar;}); }
+Tensor div(const Tensor& a, float scalar) { return elementwise_unary(a,[scalar](float x){return x/scalar;},[scalar](float,float g){return g/scalar;}); }
+Tensor neg(const Tensor& a) { return elementwise_unary(a,[](float x){return -x;},[](float,float g){return -g;}); }
+Tensor exp(const Tensor& a) { return elementwise_unary(a,[](float x){return std::exp(x);},[](float x,float g){return g*std::exp(x);}); }
+Tensor log(const Tensor& a) { return elementwise_unary(a,[](float x){return std::log(x);},[](float x,float g){return g/x;}); }
+Tensor sqrt(const Tensor& a) { return elementwise_unary(a,[](float x){return std::sqrt(x);},[](float x,float g){return g/(2.0f*std::sqrt(x));}); }
+Tensor silu(const Tensor& a) {
+    return elementwise_unary(a, [](float x){ const float s=1.0f/(1.0f+std::exp(-x)); return x*s; },
+                             [](float x,float g){ const float s=1.0f/(1.0f+std::exp(-x)); return g*(s+x*s*(1.0f-s)); });
+}
+
+Tensor matmul(const Tensor& a, const Tensor& b) {
+    if (a.ndim() == 0 || b.ndim() == 0) throw std::invalid_argument("matmul requires rank >= 1");
+    if (a.ndim() == 1 && b.ndim() == 1) {
+        if (a.shape()[0] != b.shape()[0]) throw std::invalid_argument("matmul vector sizes mismatch");
+        float s = kernels::dot_f32(a.data().data(), b.data().data(), a.size());
+        const bool req = a.requires_grad() || b.requires_grad();
+        auto result = make_result({1}, {s}, req);
+        if (req) result.impl()->grad_fn = node_for({a,b}, [ia=a.impl(), ib=b.impl()](const std::vector<float>& gout) {
+            if (ia->requires_grad) { std::vector<float> g(ia->data.size()); for(size_t i=0;i<g.size();++i) g[i]=gout[0]*ib->data[i]; add_same_shape_grad(ia,g); }
+            if (ib->requires_grad) { std::vector<float> g(ib->data.size()); for(size_t i=0;i<g.size();++i) g[i]=gout[0]*ia->data[i]; add_same_shape_grad(ib,g); }
+        });
+        return result;
+    }
+    if (a.ndim() < 2 || b.ndim() < 2) {
+        throw std::invalid_argument("matmul supports vector-vector or tensors with rank >= 2");
+    }
+    const std::size_t M = a.shape()[a.ndim()-2];
+    const std::size_t K = a.shape()[a.ndim()-1];
+    const std::size_t Kb = b.shape()[b.ndim()-2];
+    const std::size_t N = b.shape()[b.ndim()-1];
+    if (K != Kb) throw std::invalid_argument("matmul inner dimensions mismatch");
+
+    Shape a_batch(a.shape().begin(), a.shape().end()-2);
+    Shape b_batch(b.shape().begin(), b.shape().end()-2);
+    bool b_broadcast = false;
+    if (b_batch.empty()) b_broadcast = true;
+    else if (a_batch != b_batch) throw std::invalid_argument("matmul batch dimensions mismatch");
+
+    Shape out_shape = a_batch;
+    out_shape.push_back(M); out_shape.push_back(N);
+    std::vector<float> out(numel(out_shape), 0.0f);
+    const std::size_t batch_count = a_batch.empty() ? 1 : numel(a_batch);
+    for (std::size_t batch=0; batch<batch_count; ++batch) {
+        const float* ap = a.data().data() + batch*M*K;
+        const float* bp = b.data().data() + (b_broadcast ? 0 : batch*K*N);
+        float* cp = out.data() + batch*M*N;
+        kernels::matmul_f32(ap, bp, cp, M, K, N);
+    }
+    const bool req = a.requires_grad() || b.requires_grad();
+    auto result = make_result(out_shape, std::move(out), req);
+    if (req) result.impl()->grad_fn = node_for({a,b}, [ia=a.impl(), ib=b.impl(), out_shape, a_batch, b_broadcast, M,K,N,b_batch](const std::vector<float>& gout) {
+        const std::size_t batch_count_local = a_batch.empty() ? 1 : numel(a_batch);
+        if (ia->requires_grad) {
+            std::vector<float> ga(ia->data.size(),0.0f);
+            for(size_t batch=0;batch<batch_count_local;++batch){
+                const float* bp=ib->data.data()+(b_broadcast?0:batch*K*N);
+                const float* gp=gout.data()+batch*M*N;
+                float* apg=ga.data()+batch*M*K;
+                for(size_t i=0;i<M;++i) for(size_t k=0;k<K;++k){ float s=0; for(size_t j=0;j<N;++j) s+=gp[i*N+j]*bp[k*N+j]; apg[i*K+k]+=s; }
+            }
+            add_same_shape_grad(ia,ga);
+        }
+        if (ib->requires_grad) {
+            std::vector<float> gb(ib->data.size(),0.0f);
+            for(size_t batch=0;batch<batch_count_local;++batch){
+                const float* ap=ia->data.data()+batch*M*K;
+                const float* gp=gout.data()+batch*M*N;
+                const size_t bbase=b_broadcast?0:batch*K*N;
+                for(size_t k=0;k<K;++k) for(size_t j=0;j<N;++j){ float s=0; for(size_t i=0;i<M;++i) s+=ap[i*K+k]*gp[i*N+j]; gb[bbase+k*N+j]+=s; }
+            }
+            add_same_shape_grad(ib,gb);
+        }
+    });
+    return result;
+}
+
+Tensor softmax(const Tensor& x, int axis) {
+    if (x.ndim() == 0) throw std::invalid_argument("softmax requires rank >= 1");
+    int ax = axis < 0 ? static_cast<int>(x.ndim()) + axis : axis;
+    if (ax < 0 || ax >= static_cast<int>(x.ndim())) throw std::invalid_argument("softmax axis out of range");
+    Shape shape = x.shape();
+    const std::size_t axis_size = shape[ax];
+    const std::size_t outer = [&](){ std::size_t n=1; for(int i=0;i<ax;++i)n*=shape[i]; return n; }();
+    const std::size_t inner = [&](){ std::size_t n=1; for(size_t i=ax+1;i<shape.size();++i)n*=shape[i]; return n; }();
+    std::vector<float> out(x.size());
+    for(std::size_t o=0;o<outer;++o){
+        for(std::size_t i=0;i<inner;++i){
+            float maxv=-std::numeric_limits<float>::infinity();
+            for(std::size_t a=0;a<axis_size;++a) maxv=std::max(maxv,x.data()[(o*axis_size+a)*inner+i]);
+            float sumv=0;
+            for(std::size_t a=0;a<axis_size;++a){ float e=std::exp(x.data()[(o*axis_size+a)*inner+i]-maxv); out[(o*axis_size+a)*inner+i]=e; sumv+=e; }
+            for(std::size_t a=0;a<axis_size;++a) out[(o*axis_size+a)*inner+i]/=sumv;
+        }
+    }
+    auto req=x.requires_grad();
+    auto result=make_result(shape,std::move(out),req);
+    if(req) result.impl()->grad_fn=node_for({x},[ix=x.impl(), shape, axis_size, outer, inner](const std::vector<float>& gout){
+        std::vector<float> gx(ix->data.size(),0.0f);
+        const auto& y = ix; // input only; output is reconstructed below from input for stable backward.
+        (void)y;
+        // Recompute softmax probabilities from the saved input.
+        for(std::size_t o=0;o<outer;++o) for(std::size_t i=0;i<inner;++i){
+            float maxv=-std::numeric_limits<float>::infinity();
+            for(std::size_t a=0;a<axis_size;++a) maxv=std::max(maxv,ix->data[(o*axis_size+a)*inner+i]);
+            float sumv=0; std::vector<float> probs(axis_size);
+            for(std::size_t a=0;a<axis_size;++a){ float e=std::exp(ix->data[(o*axis_size+a)*inner+i]-maxv); probs[a]=e; sumv+=e; }
+            for(float& p:probs)p/=sumv;
+            float dot=0; for(std::size_t a=0;a<axis_size;++a) dot+=gout[(o*axis_size+a)*inner+i]*probs[a];
+            for(std::size_t a=0;a<axis_size;++a) gx[(o*axis_size+a)*inner+i]+=probs[a]*(gout[(o*axis_size+a)*inner+i]-dot);
+        }
+        add_same_shape_grad(ix,gx);
+    });
+    return result;
+}
+
+Tensor rmsnorm(const Tensor& x, const Tensor& weight, float eps) {
+    if (x.ndim()<1 || weight.ndim()!=1 || weight.shape()[0]!=x.shape().back()) throw std::invalid_argument("rmsnorm shape mismatch");
+    const std::size_t d=x.shape().back();
+    const std::size_t rows=x.size()/d;
+    std::vector<float> out(x.size());
+    std::vector<float> inv(rows);
+    for(std::size_t r=0;r<rows;++r){
+        float mean_sq=0; for(std::size_t j=0;j<d;++j){float v=x.data()[r*d+j]; mean_sq+=v*v;} mean_sq/=static_cast<float>(d);
+        inv[r]=1.0f/std::sqrt(mean_sq+eps);
+        for(std::size_t j=0;j<d;++j) out[r*d+j]=x.data()[r*d+j]*inv[r]*weight.data()[j];
+    }
+    const bool req=x.requires_grad()||weight.requires_grad();
+    auto result=make_result(x.shape(),std::move(out),req);
+    if(req) result.impl()->grad_fn=node_for({x,weight},[ix=x.impl(),iw=weight.impl(),d,rows,eps](const std::vector<float>& gout){
+        std::vector<float> gx(ix->data.size(),0.0f), gw(iw->data.size(),0.0f);
+        for(std::size_t r=0;r<rows;++r){
+            float mean_sq=0; for(size_t j=0;j<d;++j){float v=ix->data[r*d+j];mean_sq+=v*v;} mean_sq/=static_cast<float>(d);
+            float inv=1.0f/std::sqrt(mean_sq+eps);
+            float S=0; for(size_t j=0;j<d;++j) S+=gout[r*d+j]*iw->data[j]*ix->data[r*d+j];
+            for(size_t j=0;j<d;++j){
+                float xj=ix->data[r*d+j], gj=gout[r*d+j], wj=iw->data[j];
+                gx[r*d+j]+=gj*wj*inv - xj*inv*inv*inv*S/static_cast<float>(d);
+                gw[j]+=gj*xj*inv;
+            }
+        }
+        add_same_shape_grad(ix,gx); add_same_shape_grad(iw,gw);
+    });
+    return result;
+}
+
+Tensor rope(const Tensor& x, float theta) {
+    if (x.ndim()<2 || (x.shape().back()%2)!=0) throw std::invalid_argument("RoPE requires rank >= 2 and even last dimension");
+    const std::size_t d=x.shape().back();
+    const std::size_t t=x.shape()[x.ndim()-2];
+    const std::size_t rows=x.size()/d;
+    const std::size_t prefix_rows=rows/t;
+    std::vector<float> out(x.size());
+    for(std::size_t r=0;r<rows;++r){
+        const std::size_t pos=r%t;
+        for(std::size_t j=0;j<d;j+=2){
+            const float inv_freq=std::pow(theta,-static_cast<float>(j)/static_cast<float>(d));
+            const float angle=static_cast<float>(pos)*inv_freq;
+            const float c=std::cos(angle), s=std::sin(angle);
+            const float xe=x.data()[r*d+j], xo=x.data()[r*d+j+1];
+            out[r*d+j]=xe*c-xo*s; out[r*d+j+1]=xe*s+xo*c;
+        }
+    }
+    (void)prefix_rows;
+    auto req=x.requires_grad(); auto result=make_result(x.shape(),std::move(out),req);
+    if(req) result.impl()->grad_fn=node_for({x},[ix=x.impl(),d,t,theta](const std::vector<float>& gout){
+        std::vector<float> gx(ix->data.size());
+        const size_t rows=ix->data.size()/d;
+        for(size_t r=0;r<rows;++r){ size_t pos=r%t; for(size_t j=0;j<d;j+=2){
+            float inv_freq=std::pow(theta,-static_cast<float>(j)/static_cast<float>(d));
+            float angle=static_cast<float>(pos)*inv_freq; float c=std::cos(angle),s=std::sin(angle);
+            float ge=gout[r*d+j],go=gout[r*d+j+1]; gx[r*d+j]=ge*c+go*s; gx[r*d+j+1]=-ge*s+go*c;
+        }}
+        add_same_shape_grad(ix,gx);
+    });
+    return result;
+}
+
+Tensor embedding_lookup(const Tensor& weight, const std::vector<std::vector<int>>& token_ids) {
+    if (weight.ndim()!=2) throw std::invalid_argument("Embedding weight must be 2D");
+    const std::size_t vocab=weight.shape()[0], d=weight.shape()[1];
+    if(token_ids.empty()) throw std::invalid_argument("token_ids cannot be empty");
+    const std::size_t rows=token_ids.size(), cols=token_ids[0].size();
+    if(cols==0) throw std::invalid_argument("token_ids rows cannot be empty");
+    for(const auto& row:token_ids) if(row.size()!=cols) throw std::invalid_argument("token_ids must be rectangular");
+    std::vector<float> out(rows*cols*d);
+    for(size_t r=0;r<rows;++r) for(size_t c=0;c<cols;++c){ int tok=token_ids[r][c]; if(tok<0||static_cast<size_t>(tok)>=vocab) throw std::out_of_range("token id outside vocabulary"); for(size_t j=0;j<d;++j) out[(r*cols+c)*d+j]=weight.data()[static_cast<size_t>(tok)*d+j]; }
+    auto req=weight.requires_grad(); Shape out_shape={rows,cols,d}; auto result=make_result(out_shape,std::move(out),req);
+    if(req) result.impl()->grad_fn=node_for({weight},[iw=weight.impl(),token_ids,vocab,d,rows,cols](const std::vector<float>& gout){
+        std::vector<float> gw(iw->data.size(),0.0f);
+        for(size_t r=0;r<rows;++r) for(size_t c=0;c<cols;++c){ int tok=token_ids[r][c]; size_t base=((r*cols+c)*d); size_t wbase=static_cast<size_t>(tok)*d; for(size_t j=0;j<d;++j) gw[wbase+j]+=gout[base+j]; }
+        add_same_shape_grad(iw,gw);
+    });
+    return result;
 }
 
 } // namespace orso

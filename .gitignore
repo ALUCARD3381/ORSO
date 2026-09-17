@@ -4,3 +4,7 @@ __pycache__/
 build/
 *.so
 checkpoints/*.orso
+
+# Build/package artifacts
+ORSO_phase4_complete.zip
+build/

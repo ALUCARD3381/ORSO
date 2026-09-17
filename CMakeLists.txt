@@ -1,47 +1,136 @@
-cmake_minimum_required(VERSION 3.16)
-project(ORSO LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+
+project(ORSO VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(ORSO_ENABLE_NEON "Enable ARMv7 NEON kernels when building on 32-bit ARM" ON)
+option(ORSO_ENABLE_NEON "Enable ARM NEON kernels when supported" ON)
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+    OUTPUT_VARIABLE pybind11_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 find_package(pybind11 CONFIG REQUIRED)
+# ------------------------------------------------------------
+# NEON detection
+# ------------------------------------------------------------
 
-set(ORSO_SOURCES
-    bindings/bindings.cpp
-    core/src/tensor.cpp
-    core/src/neon_kernels.cpp
-)
+include(CheckCXXSourceCompiles)
 
-pybind11_add_module(orso_core ${ORSO_SOURCES})
+set(ORSO_USE_NEON OFF)
 
-target_include_directories(orso_core PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
-)
+if(ORSO_ENABLE_NEON)
+    set(ORSO_SAVED_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS
+        "${CMAKE_REQUIRED_FLAGS} -mfpu=neon"
+    )
 
-target_compile_features(orso_core PRIVATE cxx_std_20)
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
 
-target_compile_options(orso_core PRIVATE
-    -O2
-    -Wall
-    -Wextra
-    -Wpedantic
-)
+        int main() {
+            float32x4_t v = vdupq_n_f32(1.0f);
+            (void)v;
+            return 0;
+        }
+    " ORSO_NEON_COMPILES)
 
-# ARMv7/32-bit ARM: request NEON explicitly. A scalar fallback remains available.
-if(ORSO_ENABLE_NEON AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|ARM|armv7|armv7l)")
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mfpu=neon" ORSO_COMPILER_HAS_NEON)
-    if(ORSO_COMPILER_HAS_NEON)
-        target_compile_options(orso_core PRIVATE -mfpu=neon)
-        target_compile_definitions(orso_core PRIVATE ORSO_ENABLE_NEON=1)
+    set(CMAKE_REQUIRED_FLAGS "${ORSO_SAVED_REQUIRED_FLAGS}")
+
+    if(ORSO_NEON_COMPILES)
+        set(ORSO_USE_NEON ON)
         message(STATUS "ORSO: NEON kernels enabled")
     else()
-        message(WARNING "ORSO: compiler does not accept -mfpu=neon; using scalar fallback")
+        message(STATUS "ORSO: NEON not available; using scalar fallback")
     endif()
-else()
-    message(STATUS "ORSO: scalar kernels (NEON disabled/not applicable)")
 endif()
+
+# ------------------------------------------------------------
+# Core implementation
+# ------------------------------------------------------------
+
+add_library(orso_core_impl STATIC
+    core/src/tensor.cpp
+    core/src/neon_kernels.cpp
+    core/src/transformer.cpp
+)
+
+target_include_directories(orso_core_impl
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+)
+
+target_compile_features(orso_core_impl PUBLIC cxx_std_20)
+
+if(ORSO_USE_NEON)
+    target_compile_definitions(
+        orso_core_impl
+        PUBLIC
+            ORSO_USE_NEON=1
+    )
+
+    target_compile_options(
+        orso_core_impl
+        PUBLIC
+            -mfpu=neon
+    )
+endif()
+
+# ------------------------------------------------------------
+# Python / pybind11 module
+# ------------------------------------------------------------
+
+pybind11_add_module(orso_core
+    bindings/bindings.cpp
+)
+
+target_link_libraries(
+    orso_core
+    PRIVATE
+        orso_core_impl
+)
+
+target_include_directories(
+    orso_core
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+)
+
+target_compile_features(
+    orso_core
+    PRIVATE
+        cxx_std_20
+)
+
+# ------------------------------------------------------------
+# Output
+# ------------------------------------------------------------
+
+set_target_properties(
+    orso_core
+    PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# ------------------------------------------------------------
+# Build information
+# ------------------------------------------------------------
+
+message(STATUS "----------------------------------------")
+message(STATUS "ORSO version: ${PROJECT_VERSION}")
+message(STATUS "C++ standard: C++20")
+message(STATUS "Python: ${Python3_EXECUTABLE}")
+
+if(ORSO_USE_NEON)
+    message(STATUS "ORSO SIMD: ARM NEON")
+else()
+    message(STATUS "ORSO SIMD: scalar fallback")
+endif()
+
+message(STATUS "----------------------------------------")

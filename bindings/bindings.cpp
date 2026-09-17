@@ -1,72 +1,71 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "neon_kernels.hpp"
-#include "tensor.hpp"
-
-#include <string>
-#include <vector>
+#include "orso/tensor.hpp"
+#include "orso/transformer.hpp"
 
 namespace py = pybind11;
 using orso::Tensor;
 
 PYBIND11_MODULE(orso_core, m) {
-    m.doc() = "ORSO native core - Phase 3 Tensor + Autograd + NEON";
+    m.doc() = "ORSO native core — Tensor Engine, Autograd, NEON and Transformer building blocks";
 
-    m.def("hello", []() {
-        return std::string("ORSO core OK");
-    }, "Verifica se o módulo C++ está carregado corretamente.");
-
-    m.def("neon_available", &orso::neon::available,
-          "Retorna True quando os kernels compilados com NEON estão ativos.");
+    m.def("hello", [](){ return std::string("ORSO core OK"); });
+    m.def("neon_enabled", [](){
+#ifdef ORSO_USE_NEON
+        return true;
+#else
+        return false;
+#endif
+    });
 
     py::class_<Tensor>(m, "Tensor")
-        .def(py::init<>())
-        .def(py::init<const std::vector<std::size_t>&>(), py::arg("shape"))
-        .def(py::init<const std::vector<std::size_t>&, const std::vector<float>&>(),
-             py::arg("shape"), py::arg("data"))
-        .def_static("zeros", &Tensor::zeros, py::arg("shape"))
-        .def_static("ones", &Tensor::ones, py::arg("shape"))
-        .def_static("full", &Tensor::full, py::arg("shape"), py::arg("value"))
+        .def(py::init<const orso::Shape&, float, bool>(), py::arg("shape"), py::arg("fill")=0.0f, py::arg("requires_grad")=false)
+        .def_static("zeros", &Tensor::zeros, py::arg("shape"), py::arg("requires_grad")=false)
+        .def_static("ones", &Tensor::ones, py::arg("shape"), py::arg("requires_grad")=false)
+        .def_static("full", &Tensor::full, py::arg("shape"), py::arg("value"), py::arg("requires_grad")=false)
+        .def_static("random_normal", &Tensor::random_normal, py::arg("shape"), py::arg("mean")=0.0f, py::arg("stddev")=1.0f, py::arg("seed")=0ULL, py::arg("requires_grad")=false)
         .def_property_readonly("shape", &Tensor::shape)
         .def_property_readonly("ndim", &Tensor::ndim)
-        .def("size", &Tensor::size)
-        .def("empty", &Tensor::empty)
+        .def_property_readonly("size", &Tensor::size)
+        .def_property("requires_grad", &Tensor::requires_grad, &Tensor::set_requires_grad)
+        .def_property_readonly("data", [](const Tensor& t){ return t.data(); })
+        .def_property_readonly("grad", [](const Tensor& t){ return t.grad(); })
         .def("item", &Tensor::item)
-        .def("get", &Tensor::get, py::arg("indices"))
-        .def("set", &Tensor::set, py::arg("indices"), py::arg("value"))
-        .def("data", [](const Tensor& self) { return self.data(); })
-        .def("reshape", &Tensor::reshape, py::arg("shape"))
-        .def("transpose", py::overload_cast<>(&Tensor::transpose, py::const_))
-        .def("transpose", py::overload_cast<const std::vector<std::size_t>&>(&Tensor::transpose, py::const_), py::arg("axes"))
-        .def("add", &Tensor::add, py::arg("other"))
-        .def("sub", &Tensor::sub, py::arg("other"))
-        .def("mul", py::overload_cast<const Tensor&>(&Tensor::mul, py::const_), py::arg("other"))
-        .def("mul", py::overload_cast<float>(&Tensor::mul, py::const_), py::arg("scalar"))
-        .def("div", py::overload_cast<const Tensor&>(&Tensor::div, py::const_), py::arg("other"))
-        .def("div", py::overload_cast<float>(&Tensor::div, py::const_), py::arg("scalar"))
-        .def("neg", &Tensor::neg)
-        .def("matmul", &Tensor::matmul, py::arg("other"))
-        .def("requires_grad", &Tensor::requires_grad)
-        .def("set_requires_grad", &Tensor::set_requires_grad, py::arg("value"))
-        .def("has_grad", &Tensor::has_grad)
-        .def("grad", &Tensor::grad)
+        .def("get", &Tensor::get)
+        .def("set", &Tensor::set)
         .def("zero_grad", &Tensor::zero_grad)
-        .def("backward", py::overload_cast<>(&Tensor::backward))
-        .def("backward", py::overload_cast<const Tensor&>(&Tensor::backward), py::arg("grad"))
-        .def("fill", &Tensor::fill, py::arg("value"))
-        .def("__repr__", &Tensor::repr)
-        .def("__add__", &Tensor::add)
-        .def("__sub__", &Tensor::sub)
-        .def("__mul__", [](const Tensor& self, py::object other) {
-            if (py::isinstance<Tensor>(other)) return self.mul(other.cast<Tensor>());
-            return self.mul(other.cast<float>());
-        })
-        .def("__rmul__", [](const Tensor& self, float scalar) { return self.mul(scalar); })
-        .def("__truediv__", [](const Tensor& self, py::object other) {
-            if (py::isinstance<Tensor>(other)) return self.div(other.cast<Tensor>());
-            return self.div(other.cast<float>());
-        })
-        .def("__neg__", &Tensor::neg)
-        .def("__matmul__", &Tensor::matmul);
+        .def("backward", [](Tensor& self, py::object grad_obj){
+            if (grad_obj.is_none()) { self.backward(); return; }
+            auto grad = grad_obj.cast<Tensor>(); self.backward(&grad);
+        }, py::arg("grad")=py::none())
+        .def("reshape", &Tensor::reshape)
+        .def("transpose", &Tensor::transpose)
+        .def("sum", &Tensor::sum)
+        .def("mean", &Tensor::mean)
+        .def("__repr__", &Tensor::repr);
+
+    m.def("add", py::overload_cast<const Tensor&, const Tensor&>(&orso::add));
+    m.def("add_scalar", py::overload_cast<const Tensor&, float>(&orso::add));
+    m.def("sub", py::overload_cast<const Tensor&, const Tensor&>(&orso::sub));
+    m.def("sub_scalar", py::overload_cast<const Tensor&, float>(&orso::sub));
+    m.def("mul", py::overload_cast<const Tensor&, const Tensor&>(&orso::mul));
+    m.def("mul_scalar", py::overload_cast<const Tensor&, float>(&orso::mul));
+    m.def("div", py::overload_cast<const Tensor&, const Tensor&>(&orso::div));
+    m.def("div_scalar", py::overload_cast<const Tensor&, float>(&orso::div));
+    m.def("neg", &orso::neg);
+    m.def("exp", &orso::exp);
+    m.def("log", &orso::log);
+    m.def("sqrt", &orso::sqrt);
+    m.def("silu", &orso::silu);
+    m.def("matmul", &orso::matmul);
+    m.def("softmax", &orso::softmax, py::arg("x"), py::arg("axis")=-1);
+    m.def("rmsnorm", &orso::rmsnorm, py::arg("x"), py::arg("weight"), py::arg("eps")=1e-5f);
+    m.def("rope", &orso::rope, py::arg("x"), py::arg("theta")=10000.0f);
+    m.def("embedding", &orso::embedding_lookup, py::arg("weight"), py::arg("token_ids"));
+    m.def("causal_mask", &orso::causal_mask);
+    m.def("multi_head_attention", &orso::multi_head_attention,
+          py::arg("x"), py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"),
+          py::arg("num_heads"), py::arg("causal")=true, py::arg("rope_theta")=10000.0f);
+    m.def("swiglu", &orso::swiglu);
 }
