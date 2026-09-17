@@ -67,7 +67,7 @@ ORSO/
 │   ├── train_toy.py
 │   ├── infer.py
 │   ├── chat.py
-│   └── inspect.py
+│   └── inspect_checkpoint.py
 ├── tests/
 │   ├── test_step1.py
 │   ├── test_phase2.py
