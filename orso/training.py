@@ -75,3 +75,20 @@ class Trainer:
 
     def load_state_dict(self, state: dict[str, int]) -> None:
         self.steps = int(state["steps"])
+
+    def eval_batch(self, inputs: list[list[int]], targets: list[list[int]]) -> float:
+        """Computes loss for one batch without touching gradients or weights."""
+        logits = self.model.forward(inputs)
+        loss = cross_entropy(logits, targets)
+        return float(loss.item())
+
+
+def evaluate(trainer: Trainer, dataset, batch_size: int) -> float:
+    """Average loss over a full pass of `dataset` (no shuffling, no grad update)."""
+    losses = [
+        trainer.eval_batch(inputs, targets)
+        for inputs, targets in dataset.batches(batch_size, shuffle=False)
+    ]
+    if not losses:
+        raise ValueError("validation dataset produced no batches")
+    return sum(losses) / len(losses)

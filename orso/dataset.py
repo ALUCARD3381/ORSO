@@ -6,6 +6,22 @@ import random
 from typing import Iterable, Sequence
 
 
+def split_token_ids(
+    token_ids: Sequence[int], val_fraction: float = 0.1
+) -> tuple[list[int], list[int]]:
+    """Splits one token stream into a train and a validation slice.
+
+    The split is a single contiguous cut near the end of the stream (no
+    shuffling), so validation tokens never leak into training windows.
+    """
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be strictly between 0 and 1")
+    ids = list(map(int, token_ids))
+    split_index = int(len(ids) * (1.0 - val_fraction))
+    train_ids, val_ids = ids[:split_index], ids[split_index:]
+    return train_ids, val_ids
+
+
 class CausalDataset:
     """Slices one token stream into fixed-length next-token prediction samples."""
 
