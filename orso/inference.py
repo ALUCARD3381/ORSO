@@ -1,5 +1,4 @@
-"""Autoregressive inference utilities for ORSO Phase 6."""
-
+"""Autoregressive inference utilities for ORSO with top-k/top-p sampling."""
 from __future__ import annotations
 
 import math
@@ -7,22 +6,39 @@ import random
 from typing import Iterable
 
 
-def _sample_index(logits: list[float], temperature: float, top_k: int, rng: random.Random) -> int:
+def _sample_index(logits: list[float], temperature: float, top_k: int, rng: random.Random, top_p: float = 1.0) -> int:
     if not logits:
         raise ValueError("cannot sample from empty logits")
     if temperature <= 0.0:
         return max(range(len(logits)), key=logits.__getitem__)
-
     scaled = [x / temperature for x in logits]
     indices = list(range(len(scaled)))
-    if top_k > 0 and top_k < len(indices):
+    if top_k > 0:
+        if top_k > len(indices):
+            top_k = len(indices)
         indices.sort(key=scaled.__getitem__, reverse=True)
         indices = indices[:top_k]
+    else:
+        indices.sort(key=scaled.__getitem__, reverse=True)
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError("top_p must be in (0, 1]")
     max_logit = max(scaled[i] for i in indices)
     weights = [math.exp(scaled[i] - max_logit) for i in indices]
     total = sum(weights)
     if not math.isfinite(total) or total <= 0.0:
         return max(indices, key=scaled.__getitem__)
+    if top_p < 1.0:
+        kept: list[int] = []
+        accum = 0.0
+        for i, weight in zip(indices, weights):
+            prob = weight / total
+            kept.append(i)
+            accum += prob
+            if accum >= top_p:
+                break
+        indices = kept
+        weights = [math.exp(scaled[i] - max_logit) for i in indices]
+        total = sum(weights)
     threshold = rng.random() * total
     accum = 0.0
     for i, weight in zip(indices, weights):
@@ -39,6 +55,7 @@ def generate_ids(
     max_new_tokens: int = 32,
     temperature: float = 0.0,
     top_k: int = 0,
+    top_p: float = 1.0,
     seed: int = 0,
     eos_token_id: int | None = None,
 ) -> list[int]:
@@ -49,6 +66,8 @@ def generate_ids(
         raise ValueError("top_k must be >= 0")
     if not math.isfinite(float(temperature)):
         raise ValueError("temperature must be finite")
+    if not (0.0 < float(top_p) <= 1.0):
+        raise ValueError("top_p must be in (0, 1]")
     ids = [int(x) for x in prompt_ids]
     if not ids:
         raise ValueError("prompt_ids cannot be empty")
@@ -59,39 +78,20 @@ def generate_ids(
             raise ValueError(f"prompt token out of range: {token}")
     if eos_token_id is not None and (eos_token_id < 0 or eos_token_id >= vocab_size):
         raise ValueError("eos_token_id out of range")
-
     for _ in range(max_new_tokens):
-        context = ids[-model.context_length :]
+        context = ids[-int(model.config.context_length) :]
         logits = model.forward([context])
         seq = int(logits.shape[1])
         vocab = int(logits.shape[2])
         base = (seq - 1) * vocab
-        next_id = _sample_index(list(logits.data[base : base + vocab]), temperature, top_k, rng)
+        next_id = _sample_index(list(logits.data[base : base + vocab]), temperature, top_k, rng, top_p=top_p)
         ids.append(next_id)
         if eos_token_id is not None and next_id == eos_token_id:
             break
     return ids
 
 
-def generate_text(
-    model,
-    tokenizer,
-    prompt: str,
-    *,
-    max_new_tokens: int = 32,
-    temperature: float = 0.0,
-    top_k: int = 0,
-    seed: int = 0,
-    eos_token_id: int | None = None,
-) -> str:
+def generate_text(model, tokenizer, prompt: str, **kwargs) -> str:
     ids = tokenizer.encode(prompt)
-    generated = generate_ids(
-        model,
-        ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        seed=seed,
-        eos_token_id=eos_token_id,
-    )
+    generated = generate_ids(model, ids, **kwargs)
     return tokenizer.decode(generated)

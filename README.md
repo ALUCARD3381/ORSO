@@ -8,7 +8,7 @@
 [![Architecture](https://img.shields.io/badge/target-ARMv7%20%2B%20NEON-informational)](https://developer.arm.com/documentation/)
 
 **Repository:** `ALUCARD3381/ORSO`  
-**Release:** `0.4.0`
+**Release:** `0.7.0`
 
 ORSO é um projeto de pesquisa/engenharia para construir uma pequena LLM local, do zero, com uma arquitetura híbrida **C++20 + Python**. O núcleo numérico pesado vive em C++ e é exposto ao Python através de **pybind11**; a camada Python fica responsável pela composição do modelo, tokenizer, dataset, treino e CLI.
 
