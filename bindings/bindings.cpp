@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "neon_kernels.hpp"
 #include "tensor.hpp"
 
 #include <string>
@@ -10,11 +11,14 @@ namespace py = pybind11;
 using orso::Tensor;
 
 PYBIND11_MODULE(orso_core, m) {
-    m.doc() = "ORSO native core - Phase 2 Tensor Engine";
+    m.doc() = "ORSO native core - Phase 3 Tensor + Autograd + NEON";
 
     m.def("hello", []() {
         return std::string("ORSO core OK");
     }, "Verifica se o módulo C++ está carregado corretamente.");
+
+    m.def("neon_available", &orso::neon::available,
+          "Retorna True quando os kernels compilados com NEON estão ativos.");
 
     py::class_<Tensor>(m, "Tensor")
         .def(py::init<>())
@@ -43,23 +47,24 @@ PYBIND11_MODULE(orso_core, m) {
         .def("div", py::overload_cast<float>(&Tensor::div, py::const_), py::arg("scalar"))
         .def("neg", &Tensor::neg)
         .def("matmul", &Tensor::matmul, py::arg("other"))
+        .def("requires_grad", &Tensor::requires_grad)
+        .def("set_requires_grad", &Tensor::set_requires_grad, py::arg("value"))
+        .def("has_grad", &Tensor::has_grad)
+        .def("grad", &Tensor::grad)
+        .def("zero_grad", &Tensor::zero_grad)
+        .def("backward", py::overload_cast<>(&Tensor::backward))
+        .def("backward", py::overload_cast<const Tensor&>(&Tensor::backward), py::arg("grad"))
         .def("fill", &Tensor::fill, py::arg("value"))
         .def("__repr__", &Tensor::repr)
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", [](const Tensor& self, py::object other) {
-            if (py::isinstance<Tensor>(other)) {
-                return self.mul(other.cast<Tensor>());
-            }
+            if (py::isinstance<Tensor>(other)) return self.mul(other.cast<Tensor>());
             return self.mul(other.cast<float>());
         })
-        .def("__rmul__", [](const Tensor& self, float scalar) {
-            return self.mul(scalar);
-        })
+        .def("__rmul__", [](const Tensor& self, float scalar) { return self.mul(scalar); })
         .def("__truediv__", [](const Tensor& self, py::object other) {
-            if (py::isinstance<Tensor>(other)) {
-                return self.div(other.cast<Tensor>());
-            }
+            if (py::isinstance<Tensor>(other)) return self.div(other.cast<Tensor>());
             return self.div(other.cast<float>());
         })
         .def("__neg__", &Tensor::neg)
